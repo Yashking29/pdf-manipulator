@@ -5,6 +5,7 @@ const multer = require('multer')
 const cors = require('cors')
 const rateLimit = require('express-rate-limit')
 const Anthropic = require('@anthropic-ai/sdk')
+const { GoogleGenerativeAI } = require('@google/generative-ai')
 const dotenv = require('dotenv')
 const { v4: uuidv4 } = require('uuid')
 const path = require('path')
@@ -19,7 +20,25 @@ const upload = multer({
   limits: { fileSize: 50 * 1024 * 1024 }
 })
 
-const client = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY })
+// ── AI provider setup ─────────────────────────────────────────────────────────
+// AI_PROVIDER: 'anthropic' | 'gemini' | 'both'
+// 'both' uses Anthropic as primary and falls back to Gemini on failure
+const AI_PROVIDER = (process.env.AI_PROVIDER || 'anthropic').toLowerCase()
+
+let anthropicClient = null
+if (AI_PROVIDER === 'anthropic' || AI_PROVIDER === 'both') {
+  if (process.env.ANTHROPIC_API_KEY) {
+    anthropicClient = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY })
+  }
+}
+
+let geminiFlash = null
+if (AI_PROVIDER === 'gemini' || AI_PROVIDER === 'both') {
+  if (process.env.GEMINI_API_KEY) {
+    const genai = new GoogleGenerativeAI(process.env.GEMINI_API_KEY)
+    geminiFlash = genai.getGenerativeModel({ model: 'gemini-1.5-flash' })
+  }
+}
 
 // ── Free-tier usage tracking ──────────────────────────────────────────────────
 // IP → { count, resetAt }  (resets every 30 days)
@@ -155,28 +174,21 @@ function extractJson(text) {
   return JSON.parse(text.slice(start, end + 1))
 }
 
-// OCR fallback: uses Claude Haiku's PDF vision to read scanned pages
-// Only attempted when pdf-parse returns no readable text (< 30 chars)
-async function extractTextWithOcr(pdfBuffer) {
+// ── OCR ───────────────────────────────────────────────────────────────────────
+
+async function ocrWithAnthropic(pdfBuffer) {
   if (pdfBuffer.length > 5 * 1024 * 1024) {
     throw new Error('Scanned PDF is too large for OCR. Please compress it under 5 MB and try again.')
   }
-  const b64 = pdfBuffer.toString('base64')
-  const msg = await client.messages.create(
+  const msg = await anthropicClient.messages.create(
     {
       model: 'claude-haiku-4-5-20251001',
       max_tokens: 8192,
       messages: [{
         role: 'user',
         content: [
-          {
-            type: 'document',
-            source: { type: 'base64', media_type: 'application/pdf', data: b64 },
-          },
-          {
-            type: 'text',
-            text: 'Extract all text from this document exactly as it appears. Preserve numbers, dates, amounts, names, and table structure. Output only the raw extracted text with no commentary.',
-          },
+          { type: 'document', source: { type: 'base64', media_type: 'application/pdf', data: pdfBuffer.toString('base64') } },
+          { type: 'text', text: 'Extract all text from this document exactly as it appears. Preserve numbers, dates, amounts, names, and table structure. Output only the raw extracted text with no commentary.' },
         ],
       }],
     },
@@ -184,6 +196,118 @@ async function extractTextWithOcr(pdfBuffer) {
   )
   const block = msg.content.find(b => b.type === 'text')
   return block ? block.text : ''
+}
+
+async function ocrWithGemini(pdfBuffer) {
+  if (pdfBuffer.length > 5 * 1024 * 1024) {
+    throw new Error('Scanned PDF is too large for OCR. Please compress it under 5 MB and try again.')
+  }
+  const result = await geminiFlash.generateContent([
+    { inlineData: { mimeType: 'application/pdf', data: pdfBuffer.toString('base64') } },
+    { text: 'Extract all text from this document exactly as it appears. Preserve numbers, dates, amounts, names, and table structure. Output only the raw extracted text with no commentary.' },
+  ])
+  return result.response.text()
+}
+
+async function runOcr(pdfBuffer) {
+  if (AI_PROVIDER === 'gemini') return ocrWithGemini(pdfBuffer)
+  try {
+    return await ocrWithAnthropic(pdfBuffer)
+  } catch (e) {
+    if (AI_PROVIDER !== 'both') throw e
+    console.error('[OCR] Anthropic failed, trying Gemini:', e.message)
+    return ocrWithGemini(pdfBuffer)
+  }
+}
+
+// ── Analysis ──────────────────────────────────────────────────────────────────
+
+const ANALYSIS_SYSTEM = 'You are an expert financial and business document analyst. Extract structured data from the document. Respond with ONLY valid raw JSON matching the provided schema. No markdown fences, no explanation, just the JSON object.'
+
+function buildAnalysisPrompt(type, schema) {
+  return `Analyze the document and return a JSON object matching this schema:\n${schema}\n\nRules:\n- Extract 4-6 key metrics with emojis (💰 for money, 📅 for dates, 🔢 for counts, 📊 for rates)\n- Bar chart: ${type === 'invoice' ? 'top line items by amount (max 6 items)' : 'top KPIs or categories (max 6)'}\n- Pie chart: ${type === 'invoice' ? 'cost breakdown (subtotal, tax, fees, discounts)' : 'distribution or segment breakdown'}\n- Line chart: ${type === 'invoice' ? 'billing trend or payment schedule (use months or quarters)' : 'time-series trend (months, quarters, or milestones)'} — provide at least 5 data points\n- All chart values must be raw numbers (not strings with $ or %)\n- Respond with raw JSON ONLY`
+}
+
+async function analyzeWithAnthropic(truncatedText, type, schema) {
+  const streamRequest = anthropicClient.messages.stream({
+    model: 'claude-opus-4-6',
+    max_tokens: 64000,
+    thinking: { type: 'adaptive' },
+    system: `${ANALYSIS_SYSTEM} Document type: ${type}.`,
+    messages: [{
+      role: 'user',
+      content: [
+        { type: 'text', text: `Document content:\n\n${truncatedText}`, cache_control: { type: 'ephemeral' } },
+        { type: 'text', text: buildAnalysisPrompt(type, schema) },
+      ]
+    }]
+  })
+  const timeout = new Promise((_, reject) =>
+    setTimeout(() => reject(new Error('Analysis timed out after 110 seconds. Please try again.')), 110_000)
+  )
+  const message = await Promise.race([streamRequest.finalMessage(), timeout])
+  const textBlock = message.content.find(b => b.type === 'text')
+  if (!textBlock) throw new Error('No text response from AI')
+  return extractJson(textBlock.text)
+}
+
+async function analyzeWithGemini(truncatedText, type, schema) {
+  const result = await geminiFlash.generateContent(
+    `${ANALYSIS_SYSTEM} Document type: ${type}.\n\nDocument content:\n\n${truncatedText}\n\n${buildAnalysisPrompt(type, schema)}`
+  )
+  return extractJson(result.response.text())
+}
+
+async function runAnalysis(truncatedText, type, schema) {
+  if (AI_PROVIDER === 'gemini') return analyzeWithGemini(truncatedText, type, schema)
+  try {
+    return await analyzeWithAnthropic(truncatedText, type, schema)
+  } catch (e) {
+    if (AI_PROVIDER !== 'both') throw e
+    console.error('[Analysis] Anthropic failed, trying Gemini:', e.message)
+    return analyzeWithGemini(truncatedText, type, schema)
+  }
+}
+
+// ── Chat ──────────────────────────────────────────────────────────────────────
+
+async function chatWithAnthropic(message, docText, docType) {
+  const chatStream = anthropicClient.messages.stream({
+    model: 'claude-haiku-4-5-20251001',
+    max_tokens: 4096,
+    system: `You are a helpful assistant analyzing a ${docType} document. Answer questions concisely and accurately based only on the document content. Be direct and professional.`,
+    messages: [{
+      role: 'user',
+      content: [
+        { type: 'text', text: `Document content:\n\n${docText}`, cache_control: { type: 'ephemeral' } },
+        { type: 'text', text: message },
+      ]
+    }]
+  })
+  const chatTimeout = new Promise((_, reject) =>
+    setTimeout(() => reject(new Error('Chat request timed out. Please try again.')), 55_000)
+  )
+  const chatMessage = await Promise.race([chatStream.finalMessage(), chatTimeout])
+  const textBlock = chatMessage.content.find(b => b.type === 'text')
+  return textBlock ? textBlock.text : 'No response generated.'
+}
+
+async function chatWithGemini(message, docText, docType) {
+  const result = await geminiFlash.generateContent(
+    `You are a helpful assistant analyzing a ${docType} document. Answer questions concisely and accurately based only on the document content. Be direct and professional.\n\nDocument content:\n\n${docText}\n\nQuestion: ${message}`
+  )
+  return result.response.text()
+}
+
+async function runChat(message, docText, docType) {
+  if (AI_PROVIDER === 'gemini') return chatWithGemini(message, docText, docType)
+  try {
+    return await chatWithAnthropic(message, docText, docType)
+  } catch (e) {
+    if (AI_PROVIDER !== 'both') throw e
+    console.error('[Chat] Anthropic failed, trying Gemini:', e.message)
+    return chatWithGemini(message, docText, docType)
+  }
 }
 
 const INVOICE_SCHEMA = `{
@@ -294,7 +418,7 @@ app.post('/api/analyze', analyzeLimiter, requireAccess, upload.single('pdf'), as
     if (!pdfText || pdfText.trim().length < 30) {
       send({ type: 'progress', msg: 'Scanned PDF detected — running OCR…', pct: 22 })
       try {
-        pdfText = await extractTextWithOcr(req.file.buffer)
+        pdfText = await runOcr(req.file.buffer)
         usedOcr = true
         if (!pdfText || pdfText.trim().length < 30) {
           send({ type: 'error', msg: 'Could not extract readable text even after OCR. Please ensure the document is not corrupted and try again.' })
@@ -330,39 +454,9 @@ app.post('/api/analyze', analyzeLimiter, requireAccess, upload.single('pdf'), as
       thinkStep = Math.min(thinkStep + 1, THINK_MSGS.length - 1)
     }, 5000)
 
-    // ── Claude analysis ───────────────────────────────────────────────────────
-    const streamRequest = client.messages.stream({
-      model: 'claude-opus-4-6',
-      max_tokens: 64000,
-      thinking: { type: 'adaptive' },
-      system: `You are an expert financial and business document analyst. Extract structured data from ${type} documents. Respond with ONLY valid raw JSON matching the provided schema. No markdown fences, no explanation, just the JSON object.`,
-      messages: [{
-        role: 'user',
-        content: [
-          {
-            type: 'text',
-            text: `Document content:\n\n${truncatedText}`,
-            cache_control: { type: 'ephemeral' }
-          },
-          {
-            type: 'text',
-            text: `Analyze the above ${type} document and return a JSON object matching this schema:\n${schema}\n\nRules:\n- Extract 4-6 key metrics with emojis (💰 for money, 📅 for dates, 🔢 for counts, 📊 for rates)\n- Bar chart: ${type === 'invoice' ? 'top line items by amount (max 6 items)' : 'top KPIs or categories (max 6)'}\n- Pie chart: ${type === 'invoice' ? 'cost breakdown (subtotal, tax, fees, discounts)' : 'distribution or segment breakdown'}\n- Line chart: ${type === 'invoice' ? 'billing trend or payment schedule (use months or quarters)' : 'time-series trend (months, quarters, or milestones)'} - provide at least 5 data points\n- All chart values must be raw numbers (not strings with $ or %)\n- Respond with raw JSON ONLY`
-          }
-        ]
-      }]
-    })
-
-    const timeout = new Promise((_, reject) =>
-      setTimeout(() => reject(new Error('Analysis timed out after 110 seconds. Please try again.')), 110_000)
-    )
-
-    const message = await Promise.race([streamRequest.finalMessage(), timeout])
+    // ── AI analysis (routed by AI_PROVIDER) ──────────────────────────────────
+    const analysis = await runAnalysis(truncatedText, type, schema)
     clearInterval(ticker); ticker = null
-
-    const textBlock = message.content.find(b => b.type === 'text')
-    if (!textBlock) throw new Error('No text response from AI')
-
-    const analysis = extractJson(textBlock.text)
 
     send({ type: 'progress', msg: 'Building your dashboard…', pct: 95 })
 
@@ -399,34 +493,8 @@ app.post('/api/chat', async (req, res) => {
     const doc = docStore.get(downloadId)
     if (!doc) return res.status(404).json({ error: 'Document session expired. Please re-upload the PDF.' })
 
-    // Haiku is 10x cheaper than Opus and perfectly capable for Q&A on extracted text
-    const chatStream = client.messages.stream({
-      model: 'claude-haiku-4-5-20251001',
-      max_tokens: 4096,
-      system: `You are a helpful assistant analyzing a ${doc.type} document. Answer questions concisely and accurately based only on the document content. Be direct and professional.`,
-      messages: [{
-        role: 'user',
-        content: [
-          {
-            type: 'text',
-            text: `Document content:\n\n${doc.text}`,
-            cache_control: { type: 'ephemeral' }
-          },
-          {
-            type: 'text',
-            text: message
-          }
-        ]
-      }]
-    })
-
-    const chatTimeout = new Promise((_, reject) =>
-      setTimeout(() => reject(new Error('Chat request timed out. Please try again.')), 55_000)
-    )
-
-    const chatMessage = await Promise.race([chatStream.finalMessage(), chatTimeout])
-    const textBlock = chatMessage.content.find(b => b.type === 'text')
-    res.json({ reply: textBlock ? textBlock.text : 'No response generated.' })
+    const reply = await runChat(message, doc.text, doc.type)
+    res.json({ reply })
 
   } catch (err) {
     console.error('[chat]', err)
@@ -775,8 +843,15 @@ if (fs.existsSync(CLIENT_DIST)) {
 
 const PORT = process.env.PORT || 3001
 const server = app.listen(PORT, () => {
+  const providerStatus = {
+    anthropic: process.env.ANTHROPIC_API_KEY ? '✓' : '✗ missing ANTHROPIC_API_KEY',
+    gemini:    process.env.GEMINI_API_KEY    ? '✓' : '✗ missing GEMINI_API_KEY',
+  }
   console.log(`\n🚀  Briefwise server → http://localhost:${PORT}`)
-  console.log(`    API Key: ${process.env.ANTHROPIC_API_KEY ? '✓ configured' : '✗ MISSING — set ANTHROPIC_API_KEY in .env'}\n`)
+  console.log(`    AI_PROVIDER : ${AI_PROVIDER}`)
+  if (AI_PROVIDER === 'anthropic' || AI_PROVIDER === 'both') console.log(`    Anthropic   : ${providerStatus.anthropic}`)
+  if (AI_PROVIDER === 'gemini'    || AI_PROVIDER === 'both') console.log(`    Gemini      : ${providerStatus.gemini}`)
+  console.log()
 })
 
 function shutdown(signal) {
