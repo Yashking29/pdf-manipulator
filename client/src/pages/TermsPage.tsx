@@ -1,4 +1,4 @@
-import { useEffect } from 'react'
+import { useEffect, type ReactNode } from 'react'
 import { MarketingNav } from '../components/MarketingNav'
 import { MarketingFooter } from '../components/MarketingFooter'
 
@@ -6,7 +6,7 @@ const LAST_UPDATED = 'April 20, 2025'
 
 interface SectionProps {
   title: string
-  children: React.ReactNode
+  children: ReactNode
 }
 
 function Section({ title, children }: SectionProps) {
