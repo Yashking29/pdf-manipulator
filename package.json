@@ -10,7 +10,19 @@
     "build": "cd client && npm install && npm run build",
     "start": "node server/index.js"
   },
+  "dependencies": {
+    "@anthropic-ai/sdk": "^0.30.0",
+    "@google/generative-ai": "^0.24.1",
+    "cors": "^2.8.5",
+    "dotenv": "^16.4.5",
+    "express": "^4.19.2",
+    "express-rate-limit": "^8.3.2",
+    "multer": "^2.0.0",
+    "pdf-parse": "^1.1.1",
+    "uuid": "^10.0.0"
+  },
   "devDependencies": {
-    "concurrently": "^8.2.2"
+    "concurrently": "^8.2.2",
+    "nodemon": "^3.1.0"
   }
 }
