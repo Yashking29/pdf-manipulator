@@ -1,0 +1,6 @@
+User-agent: *
+Allow: /
+Allow: /share/
+Disallow: /api/
+
+Sitemap: https://briefwise.online/sitemap.xml

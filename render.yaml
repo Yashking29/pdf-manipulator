@@ -1,0 +1,23 @@
+services:
+  - type: web
+    name: briefwise
+    env: node
+    region: oregon
+    plan: free
+    buildCommand: cd client && npm install && npm run build && cd ../server && npm install
+    startCommand: node server/index.js
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: PORT
+        value: 3001
+      - key: SITE_URL
+        value: https://briefwise.online
+      - key: ALLOWED_ORIGINS
+        value: https://briefwise.online
+      - key: ANTHROPIC_API_KEY
+        sync: false          # you enter this manually in Render dashboard
+      - key: VITE_LS_CHECKOUT_URL
+        sync: false          # needed at BUILD time — set in Render dashboard
+      - key: VITE_FORMSPREE_ENDPOINT
+        sync: false          # needed at BUILD time — set in Render dashboard

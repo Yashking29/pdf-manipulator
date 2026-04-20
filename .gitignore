@@ -1,0 +1,18 @@
+# Secrets
+.env
+*.local
+
+# Dependencies
+node_modules/
+client/node_modules/
+server/node_modules/
+
+# Build output
+client/dist/
+
+# Runtime data (regenerated on server start)
+server/shares.json
+
+# OS
+.DS_Store
+Thumbs.db
