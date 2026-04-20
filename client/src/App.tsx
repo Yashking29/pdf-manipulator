@@ -113,6 +113,7 @@ export default function App() {
   }
 
   return (
+    <ErrorBoundary>
     <div className={darkMode ? 'dark' : ''}>
       <div className="min-h-screen bg-slate-50 dark:bg-slate-950 transition-colors duration-300 font-sans">
         <Navbar
