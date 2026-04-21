@@ -6,6 +6,7 @@ const cors = require('cors')
 const rateLimit = require('express-rate-limit')
 const Anthropic = require('@anthropic-ai/sdk')
 const { GoogleGenerativeAI } = require('@google/generative-ai')
+const Groq = require('groq-sdk')
 const dotenv = require('dotenv')
 const { v4: uuidv4 } = require('uuid')
 const path = require('path')
@@ -26,9 +27,14 @@ const upload = multer({
 const AI_PROVIDER = (process.env.AI_PROVIDER || 'anthropic').toLowerCase()
 
 let anthropicClient = null
-if (AI_PROVIDER === 'anthropic' || AI_PROVIDER === 'both') {
-  if (process.env.ANTHROPIC_API_KEY) {
-    anthropicClient = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY })
+if (process.env.ANTHROPIC_API_KEY) {
+  anthropicClient = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY })
+}
+
+let groqClient = null
+if (AI_PROVIDER === 'groq') {
+  if (process.env.GROQ_API_KEY) {
+    groqClient = new Groq({ apiKey: process.env.GROQ_API_KEY })
   }
 }
 
@@ -36,7 +42,7 @@ let geminiFlash = null
 if (AI_PROVIDER === 'gemini' || AI_PROVIDER === 'both') {
   if (process.env.GEMINI_API_KEY) {
     const genai = new GoogleGenerativeAI(process.env.GEMINI_API_KEY)
-    geminiFlash = genai.getGenerativeModel({ model: 'gemini-2.0-flash' })
+    geminiFlash = genai.getGenerativeModel({ model: '' })
   }
 }
 
@@ -211,6 +217,10 @@ async function ocrWithGemini(pdfBuffer) {
 
 async function runOcr(pdfBuffer) {
   if (AI_PROVIDER === 'gemini') return ocrWithGemini(pdfBuffer)
+  if (AI_PROVIDER === 'groq') {
+    if (anthropicClient) return ocrWithAnthropic(pdfBuffer)
+    throw new Error('Scanned PDF detected. OCR requires an Anthropic API key. Please use a text-based PDF.')
+  }
   try {
     return await ocrWithAnthropic(pdfBuffer)
   } catch (e) {
@@ -251,6 +261,19 @@ async function analyzeWithAnthropic(truncatedText, type, schema) {
   return extractJson(textBlock.text)
 }
 
+async function analyzeWithGroq(truncatedText, type, schema) {
+  const response = await groqClient.chat.completions.create({
+    model: 'llama-3.3-70b-versatile',
+    messages: [
+      { role: 'system', content: `${ANALYSIS_SYSTEM} Document type: ${type}.` },
+      { role: 'user', content: `Document content:\n\n${truncatedText}\n\n${buildAnalysisPrompt(type, schema)}` },
+    ],
+    max_tokens: 8192,
+    temperature: 0.1,
+  })
+  return extractJson(response.choices[0].message.content)
+}
+
 async function analyzeWithGemini(truncatedText, type, schema) {
   const result = await geminiFlash.generateContent(
     `${ANALYSIS_SYSTEM} Document type: ${type}.\n\nDocument content:\n\n${truncatedText}\n\n${buildAnalysisPrompt(type, schema)}`
@@ -260,6 +283,7 @@ async function analyzeWithGemini(truncatedText, type, schema) {
 
 async function runAnalysis(truncatedText, type, schema) {
   if (AI_PROVIDER === 'gemini') return analyzeWithGemini(truncatedText, type, schema)
+  if (AI_PROVIDER === 'groq') return analyzeWithGroq(truncatedText, type, schema)
   try {
     return await analyzeWithAnthropic(truncatedText, type, schema)
   } catch (e) {
@@ -292,6 +316,18 @@ async function chatWithAnthropic(message, docText, docType) {
   return textBlock ? textBlock.text : 'No response generated.'
 }
 
+async function chatWithGroq(message, docText, docType) {
+  const response = await groqClient.chat.completions.create({
+    model: 'llama-3.1-8b-instant',
+    messages: [
+      { role: 'system', content: `You are a helpful assistant analyzing a ${docType} document. Answer questions concisely and accurately based only on the document content. Be direct and professional.` },
+      { role: 'user', content: `Document content:\n\n${docText}\n\nQuestion: ${message}` },
+    ],
+    max_tokens: 2048,
+  })
+  return response.choices[0].message.content
+}
+
 async function chatWithGemini(message, docText, docType) {
   const result = await geminiFlash.generateContent(
     `You are a helpful assistant analyzing a ${docType} document. Answer questions concisely and accurately based only on the document content. Be direct and professional.\n\nDocument content:\n\n${docText}\n\nQuestion: ${message}`
@@ -301,6 +337,7 @@ async function chatWithGemini(message, docText, docType) {
 
 async function runChat(message, docText, docType) {
   if (AI_PROVIDER === 'gemini') return chatWithGemini(message, docText, docType)
+  if (AI_PROVIDER === 'groq') return chatWithGroq(message, docText, docType)
   try {
     return await chatWithAnthropic(message, docText, docType)
   } catch (e) {
@@ -846,11 +883,13 @@ const server = app.listen(PORT, () => {
   const providerStatus = {
     anthropic: process.env.ANTHROPIC_API_KEY ? '✓' : '✗ missing ANTHROPIC_API_KEY',
     gemini:    process.env.GEMINI_API_KEY    ? '✓' : '✗ missing GEMINI_API_KEY',
+    groq:      process.env.GROQ_API_KEY      ? '✓' : '✗ missing GROQ_API_KEY',
   }
   console.log(`\n🚀  Briefwise server → http://localhost:${PORT}`)
   console.log(`    AI_PROVIDER : ${AI_PROVIDER}`)
   if (AI_PROVIDER === 'anthropic' || AI_PROVIDER === 'both') console.log(`    Anthropic   : ${providerStatus.anthropic}`)
   if (AI_PROVIDER === 'gemini'    || AI_PROVIDER === 'both') console.log(`    Gemini      : ${providerStatus.gemini}`)
+  if (AI_PROVIDER === 'groq')                                console.log(`    Groq        : ${providerStatus.groq}`)
   console.log()
 })
 
