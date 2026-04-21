@@ -36,7 +36,7 @@ let geminiFlash = null
 if (AI_PROVIDER === 'gemini' || AI_PROVIDER === 'both') {
   if (process.env.GEMINI_API_KEY) {
     const genai = new GoogleGenerativeAI(process.env.GEMINI_API_KEY)
-    geminiFlash = genai.getGenerativeModel({ model: 'gemini-1.5-flash' })
+    geminiFlash = genai.getGenerativeModel({ model: 'gemini-2.0-flash' })
   }
 }
 
