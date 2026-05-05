@@ -1,8 +1,14 @@
 import { useState, useRef, useEffect } from 'react'
 import { motion, AnimatePresence } from 'framer-motion'
-import { FileText, Moon, Sun, Clock, X, Zap, Crown } from 'lucide-react'
+import { FileText, Moon, Sun, Clock, X, Zap, Crown, Menu } from 'lucide-react'
 import type { HistoryEntry } from '../lib/types'
 import { FREE_LIMIT } from '../hooks/useLicense'
+
+const NAV_LINKS = [
+  { label: 'Pricing', href: '/pricing' },
+  { label: 'FAQ', href: '/faq' },
+  { label: 'Contact', href: '/contact' },
+]
 
 interface NavbarProps {
   darkMode: boolean
@@ -21,6 +27,7 @@ export function Navbar({
   isPro, usesRemaining, onUpgradeClick, onDeactivateLicense,
 }: NavbarProps) {
   const [showHistory, setShowHistory] = useState(false)
+  const [mobileMenuOpen, setMobileMenuOpen] = useState(false)
   const panelRef = useRef<HTMLDivElement>(null)
 
   // Close on outside click
@@ -49,6 +56,19 @@ export function Navbar({
             Briefwise
           </span>
         </button>
+
+        {/* Desktop nav links */}
+        <div className="hidden md:flex items-center gap-1">
+          {NAV_LINKS.map(link => (
+            <a
+              key={link.label}
+              href={link.href}
+              className="px-3 py-2 text-sm font-medium text-slate-600 dark:text-slate-400 hover:text-slate-900 dark:hover:text-white hover:bg-slate-100 dark:hover:bg-slate-800 rounded-lg transition-colors"
+            >
+              {link.label}
+            </a>
+          ))}
+        </div>
 
         {/* Right controls */}
         <div className="flex items-center gap-1.5">
@@ -152,8 +172,31 @@ export function Navbar({
           >
             {darkMode ? <Sun className="w-5 h-5 text-amber-400" /> : <Moon className="w-5 h-5" />}
           </button>
+
+          {/* Mobile menu button */}
+          <button
+            onClick={() => setMobileMenuOpen(o => !o)}
+            className="md:hidden p-2 rounded-lg text-slate-500 hover:text-slate-700 dark:text-slate-400 dark:hover:text-slate-200 hover:bg-slate-100 dark:hover:bg-slate-800 transition-colors"
+          >
+            {mobileMenuOpen ? <X className="w-5 h-5" /> : <Menu className="w-5 h-5" />}
+          </button>
         </div>
       </div>
+
+      {/* Mobile menu */}
+      {mobileMenuOpen && (
+        <div className="md:hidden border-t border-slate-200 dark:border-slate-800 bg-white dark:bg-slate-950 px-4 pb-4">
+          {NAV_LINKS.map(link => (
+            <a
+              key={link.label}
+              href={link.href}
+              className="block py-3 text-sm font-medium text-slate-700 dark:text-slate-300 border-b border-slate-100 dark:border-slate-800 last:border-0"
+            >
+              {link.label}
+            </a>
+          ))}
+        </div>
+      )}
     </nav>
   )
 }
