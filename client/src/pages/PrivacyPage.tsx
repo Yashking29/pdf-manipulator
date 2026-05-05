@@ -101,7 +101,7 @@ export function PrivacyPage() {
               <li>Request deletion of data associated with your IP or license key.</li>
               <li>Withdraw consent to data processing.</li>
             </ul>
-            <p className="mt-3">To exercise these rights, email us at <a href="mailto:hello@briefwise.online" className="text-indigo-600 dark:text-indigo-400 hover:underline">hello@briefwise.online</a>.</p>
+            <p className="mt-3">To exercise these rights, email us at <a href="mailto:yashhissaria99@gmail.com" className="text-indigo-600 dark:text-indigo-400 hover:underline">yashhissaria99@gmail.com</a>.</p>
           </Section>
 
           <Section title="9. Changes to This Policy">
@@ -111,7 +111,7 @@ export function PrivacyPage() {
           <Section title="10. Contact">
             <p>If you have questions about this Privacy Policy or how we handle your data, please contact us:</p>
             <ul className="list-none mt-2 space-y-1">
-              <li><strong className="text-slate-800 dark:text-slate-200">Email:</strong> <a href="mailto:hello@briefwise.online" className="text-indigo-600 dark:text-indigo-400 hover:underline">hello@briefwise.online</a></li>
+              <li><strong className="text-slate-800 dark:text-slate-200">Email:</strong> <a href="mailto:yashhissaria99@gmail.com" className="text-indigo-600 dark:text-indigo-400 hover:underline">yashhissaria99@gmail.com</a></li>
               <li><strong className="text-slate-800 dark:text-slate-200">Website:</strong> <a href="https://briefwise.online/contact" className="text-indigo-600 dark:text-indigo-400 hover:underline">briefwise.online/contact</a></li>
             </ul>
           </Section>

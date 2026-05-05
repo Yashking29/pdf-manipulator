@@ -42,7 +42,7 @@ const FAQS = [
   },
   {
     q: 'Do you offer refunds?',
-    a: 'Yes — full refund within 7 days of your first payment, no questions asked. Email hello@briefwise.online.',
+    a: 'Yes — full refund within 7 days of your first payment, no questions asked. Email yashhissaria99@gmail.com.',
   },
   {
     q: 'What counts as one analysis?',
@@ -54,7 +54,7 @@ const FAQS = [
   },
   {
     q: 'Is there a team or enterprise plan?',
-    a: 'Not yet. If you need volume pricing or a custom plan, email hello@briefwise.online and we\'ll work something out.',
+    a: 'Not yet. If you need volume pricing or a custom plan, email yashhissaria99@gmail.com and we\'ll work something out.',
   },
 ]
 

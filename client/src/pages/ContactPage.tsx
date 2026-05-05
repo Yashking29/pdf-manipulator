@@ -77,7 +77,7 @@ export function ContactPage() {
                 icon: Mail,
                 title: 'Email us',
                 desc: 'For billing, account, or general questions.',
-                detail: 'hello@briefwise.online',
+                detail: 'yashhissaria99@gmail.com',
                 color: 'text-indigo-600 dark:text-indigo-400',
                 bg: 'bg-indigo-50 dark:bg-indigo-900/30',
               },

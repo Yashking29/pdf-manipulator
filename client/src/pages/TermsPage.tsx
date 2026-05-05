@@ -122,7 +122,7 @@ export function TermsPage() {
           <Section title="12. Contact">
             <p>If you have any questions about these Terms, please contact us:</p>
             <ul className="list-none mt-2 space-y-1">
-              <li><strong className="text-slate-800 dark:text-slate-200">Email:</strong> <a href="mailto:hello@briefwise.online" className="text-indigo-600 dark:text-indigo-400 hover:underline">hello@briefwise.online</a></li>
+              <li><strong className="text-slate-800 dark:text-slate-200">Email:</strong> <a href="mailto:yashhissaria99@gmail.com" className="text-indigo-600 dark:text-indigo-400 hover:underline">yashhissaria99@gmail.com</a></li>
               <li><strong className="text-slate-800 dark:text-slate-200">Website:</strong> <a href="https://briefwise.online/contact" className="text-indigo-600 dark:text-indigo-400 hover:underline">briefwise.online/contact</a></li>
             </ul>
           </Section>
