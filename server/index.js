@@ -11,9 +11,22 @@ const dotenv = require('dotenv')
 const { v4: uuidv4 } = require('uuid')
 const path = require('path')
 const fs = require('fs')
+const { Redis } = require('@upstash/redis')
 
 // Load .env from parent directory
 dotenv.config({ path: path.join('.env') })
+
+// ── Upstash Redis setup ──────────────────────────────────────────────────────
+let redis = null
+if (process.env.UPSTASH_REDIS_REST_URL && process.env.UPSTASH_REDIS_REST_TOKEN) {
+  redis = new Redis({
+    url: process.env.UPSTASH_REDIS_REST_URL,
+    token: process.env.UPSTASH_REDIS_REST_TOKEN,
+  })
+  console.log('[Redis] Upstash Redis connected')
+} else {
+  console.log('[Redis] No Upstash credentials — using in-memory storage (data lost on restart)')
+}
 
 const app = express()
 const upload = multer({
@@ -46,61 +59,127 @@ if (AI_PROVIDER === 'gemini' || AI_PROVIDER === 'both') {
   }
 }
 
-// ── Free-tier usage tracking ──────────────────────────────────────────────────
-// IP → { count, resetAt }  (resets every 30 days)
-const usageStore = new Map()
+// ── Usage tracking (Redis with in-memory fallback) ───────────────────────────
 const FREE_LIMIT = 3
-
-// ── Pro-tier usage tracking ───────────────────────────────────────────────────
-// licenseKey → { count, resetAt }  (resets every 30 days)
-const proUsageStore = new Map()
 const PRO_LIMIT = 100
+const THIRTY_DAYS_MS = 30 * 24 * 60 * 60 * 1000
+const THIRTY_DAYS_SEC = 30 * 24 * 60 * 60
 
-// Cache of validated license keys (survives until server restart)
-const validLicenses = new Set()
+// In-memory fallback stores (used when Redis is unavailable)
+const usageStoreFallback = new Map()
+const proUsageStoreFallback = new Map()
+const validLicensesFallback = new Set()
 
-function requireAccess(req, res, next) {
+// Redis key prefixes
+const REDIS_PREFIX = {
+  freeUsage: 'usage:free:',
+  proUsage: 'usage:pro:',
+  validLicense: 'license:valid:',
+}
+
+// Helper: Get free tier usage
+async function getFreeUsage(ip) {
+  if (redis) {
+    const data = await redis.get(`${REDIS_PREFIX.freeUsage}${ip}`)
+    return data || null
+  }
+  return usageStoreFallback.get(ip) || null
+}
+
+// Helper: Set free tier usage
+async function setFreeUsage(ip, usage) {
+  if (redis) {
+    await redis.set(`${REDIS_PREFIX.freeUsage}${ip}`, usage, { ex: THIRTY_DAYS_SEC })
+  } else {
+    usageStoreFallback.set(ip, usage)
+  }
+}
+
+// Helper: Get pro tier usage
+async function getProUsage(licenseKey) {
+  if (redis) {
+    const data = await redis.get(`${REDIS_PREFIX.proUsage}${licenseKey}`)
+    return data || null
+  }
+  return proUsageStoreFallback.get(licenseKey) || null
+}
+
+// Helper: Set pro tier usage
+async function setProUsage(licenseKey, usage) {
+  if (redis) {
+    await redis.set(`${REDIS_PREFIX.proUsage}${licenseKey}`, usage, { ex: THIRTY_DAYS_SEC })
+  } else {
+    proUsageStoreFallback.set(licenseKey, usage)
+  }
+}
+
+// Helper: Check if license is valid (cached)
+async function isLicenseValid(licenseKey) {
+  if (redis) {
+    const exists = await redis.exists(`${REDIS_PREFIX.validLicense}${licenseKey}`)
+    return exists === 1
+  }
+  return validLicensesFallback.has(licenseKey)
+}
+
+// Helper: Cache valid license
+async function cacheValidLicense(licenseKey) {
+  if (redis) {
+    // Cache for 30 days
+    await redis.set(`${REDIS_PREFIX.validLicense}${licenseKey}`, '1', { ex: THIRTY_DAYS_SEC })
+  } else {
+    validLicensesFallback.add(licenseKey)
+  }
+}
+
+async function requireAccess(req, res, next) {
   const licenseKey = (req.headers['x-license-key'] || '').trim()
   const now = Date.now()
 
-  if (licenseKey && validLicenses.has(licenseKey)) {
-    // Pro user — enforce monthly cap
-    let proUsage = proUsageStore.get(licenseKey)
-    if (!proUsage || now > proUsage.resetAt) {
-      proUsage = { count: 0, resetAt: now + 30 * 24 * 60 * 60 * 1000 }
+  try {
+    if (licenseKey && await isLicenseValid(licenseKey)) {
+      // Pro user — enforce monthly cap
+      let proUsage = await getProUsage(licenseKey)
+      if (!proUsage || now > proUsage.resetAt) {
+        proUsage = { count: 0, resetAt: now + THIRTY_DAYS_MS }
+      }
+      if (proUsage.count >= PRO_LIMIT) {
+        const daysLeft = Math.ceil((proUsage.resetAt - now) / (24 * 60 * 60 * 1000))
+        return res.status(429).json({
+          error: `You've reached the ${PRO_LIMIT} analyses/month Pro limit. Resets in ${daysLeft} day${daysLeft === 1 ? '' : 's'}.`,
+          proLimitReached: true,
+        })
+      }
+      proUsage.count++
+      await setProUsage(licenseKey, proUsage)
+      res.setHeader('X-Uses-Remaining', String(PRO_LIMIT - proUsage.count))
+      return next()
     }
-    if (proUsage.count >= PRO_LIMIT) {
-      const daysLeft = Math.ceil((proUsage.resetAt - now) / (24 * 60 * 60 * 1000))
-      return res.status(429).json({
-        error: `You've reached the ${PRO_LIMIT} analyses/month Pro limit. Resets in ${daysLeft} day${daysLeft === 1 ? '' : 's'}.`,
-        proLimitReached: true,
+
+    // Free user — enforce free cap by IP
+    const ip = req.ip || req.socket?.remoteAddress || 'unknown'
+    let usage = await getFreeUsage(ip)
+
+    if (!usage || now > usage.resetAt) {
+      usage = { count: 0, resetAt: now + THIRTY_DAYS_MS }
+    }
+
+    if (usage.count >= FREE_LIMIT) {
+      return res.status(402).json({
+        error: `You've used all ${FREE_LIMIT} free analyses this month. Upgrade to Pro for unlimited access.`,
+        limitReached: true,
       })
     }
-    proUsage.count++
-    proUsageStore.set(licenseKey, proUsage)
-    res.setHeader('X-Uses-Remaining', String(PRO_LIMIT - proUsage.count))
-    return next()
+
+    usage.count++
+    await setFreeUsage(ip, usage)
+    res.setHeader('X-Uses-Remaining', String(FREE_LIMIT - usage.count))
+    next()
+  } catch (err) {
+    console.error('[requireAccess] Redis error:', err.message)
+    // On Redis error, allow the request (fail open) to not block users
+    next()
   }
-
-  // Free user — enforce free cap by IP
-  const ip = req.ip || req.socket?.remoteAddress || 'unknown'
-  let usage = usageStore.get(ip)
-
-  if (!usage || now > usage.resetAt) {
-    usage = { count: 0, resetAt: now + 30 * 24 * 60 * 60 * 1000 }
-  }
-
-  if (usage.count >= FREE_LIMIT) {
-    return res.status(402).json({
-      error: `You've used all ${FREE_LIMIT} free analyses this month. Upgrade to Pro for unlimited access.`,
-      limitReached: true,
-    })
-  }
-
-  usage.count++
-  usageStore.set(ip, usage)
-  res.setHeader('X-Uses-Remaining', String(FREE_LIMIT - usage.count))
-  next()
 }
 
 // ── In-memory doc store ───────────────────────────────────────────────────────
@@ -387,7 +466,9 @@ app.post('/api/validate-license', async (req, res) => {
   if (!licenseKey?.trim()) return res.status(400).json({ valid: false, error: 'License key required' })
 
   const key = licenseKey.trim()
-  if (validLicenses.has(key)) return res.json({ valid: true })
+
+  // Check cache first
+  if (await isLicenseValid(key)) return res.json({ valid: true })
 
   try {
     const lsRes = await fetch('https://api.lemonsqueezy.com/v1/licenses/validate', {
@@ -397,7 +478,7 @@ app.post('/api/validate-license', async (req, res) => {
     })
     const data = await lsRes.json()
     if (data.valid) {
-      validLicenses.add(key)
+      await cacheValidLicense(key)
       return res.json({ valid: true })
     }
     res.status(400).json({ valid: false, error: data.error || 'Invalid or expired license key.' })
@@ -885,11 +966,13 @@ const server = app.listen(PORT, () => {
     gemini:    process.env.GEMINI_API_KEY    ? '✓' : '✗ missing GEMINI_API_KEY',
     groq:      process.env.GROQ_API_KEY      ? '✓' : '✗ missing GROQ_API_KEY',
   }
+  const redisStatus = redis ? '✓ Upstash Redis (persistent)' : '✗ In-memory (resets on restart)'
   console.log(`\n🚀  Briefwise server → http://localhost:${PORT}`)
   console.log(`    AI_PROVIDER : ${AI_PROVIDER}`)
   if (AI_PROVIDER === 'anthropic' || AI_PROVIDER === 'both') console.log(`    Anthropic   : ${providerStatus.anthropic}`)
   if (AI_PROVIDER === 'gemini'    || AI_PROVIDER === 'both') console.log(`    Gemini      : ${providerStatus.gemini}`)
   if (AI_PROVIDER === 'groq')                                console.log(`    Groq        : ${providerStatus.groq}`)
+  console.log(`    Storage     : ${redisStatus}`)
   console.log()
 })
 
