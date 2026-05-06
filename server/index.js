@@ -62,6 +62,67 @@ if (process.env.UPSTASH_REDIS_REST_URL && process.env.UPSTASH_REDIS_REST_TOKEN) 
   console.log('[Redis] No Upstash credentials — using in-memory storage (data lost on restart)')
 }
 
+// ── MongoDB GridFS setup (for PDF storage) ───────────────────────────────────
+let gridFSBucket = null
+
+// Initialize GridFS after MongoDB connects
+mongoose.connection.once('open', () => {
+  gridFSBucket = new mongoose.mongo.GridFSBucket(mongoose.connection.db, {
+    bucketName: 'pdfs'
+  })
+  console.log('[GridFS] PDF storage ready')
+})
+
+// GridFS helper functions
+async function uploadToGridFS(fileId, buffer, filename) {
+  if (!gridFSBucket) return false
+  try {
+    const uploadStream = gridFSBucket.openUploadStreamWithId(fileId, filename, {
+      contentType: 'application/pdf',
+    })
+    return new Promise((resolve, reject) => {
+      uploadStream.end(buffer, (err) => {
+        if (err) reject(err)
+        else resolve(true)
+      })
+    })
+  } catch (err) {
+    console.error('[GridFS] Upload failed:', err.message)
+    return false
+  }
+}
+
+async function downloadFromGridFS(fileId) {
+  if (!gridFSBucket) return null
+  try {
+    const downloadStream = gridFSBucket.openDownloadStream(fileId)
+    const chunks = []
+    return new Promise((resolve, reject) => {
+      downloadStream.on('data', chunk => chunks.push(chunk))
+      downloadStream.on('end', () => resolve(Buffer.concat(chunks)))
+      downloadStream.on('error', err => {
+        console.error('[GridFS] Download failed:', err.message)
+        resolve(null)
+      })
+    })
+  } catch (err) {
+    console.error('[GridFS] Download failed:', err.message)
+    return null
+  }
+}
+
+async function deleteFromGridFS(fileId) {
+  if (!gridFSBucket) return
+  try {
+    await gridFSBucket.delete(fileId)
+  } catch (err) {
+    // Ignore "file not found" errors
+    if (!err.message.includes('File not found')) {
+      console.error('[GridFS] Delete failed:', err.message)
+    }
+  }
+}
+
 const app = express()
 const upload = multer({
   storage: multer.memoryStorage(),
@@ -216,18 +277,62 @@ async function requireAccess(req, res, next) {
   }
 }
 
-// ── In-memory doc store ───────────────────────────────────────────────────────
-// downloadId → { buffer, filename, text, type, analysis, expires }
-// Capped at 50 entries — evicts oldest on overflow
+// ── Doc store (GridFS with in-memory fallback) ───────────────────────────────
+// downloadId → { buffer, filename, text, type, analysis, expires, gridFSId }
+// In-memory store capped at 50 entries — evicts oldest on overflow
 const docStore = new Map()
 const DOC_STORE_MAX = 50
+const DOC_TTL = 7_200_000 // 2 hours
 
-function docStoreSet(id, value) {
+async function docStoreSet(id, value) {
+  // Always store metadata in memory (for chat functionality)
   if (docStore.size >= DOC_STORE_MAX) {
     const oldest = docStore.keys().next().value
+    const oldDoc = docStore.get(oldest)
+    // Clean up GridFS when evicting from memory
+    if (oldDoc?.gridFSId) await deleteFromGridFS(oldDoc.gridFSId)
     docStore.delete(oldest)
   }
+
+  // Upload PDF to GridFS if available
+  if (gridFSBucket && value.buffer) {
+    const gridFSId = new mongoose.Types.ObjectId()
+    const uploaded = await uploadToGridFS(gridFSId, value.buffer, value.filename)
+    if (uploaded) {
+      // Store metadata without buffer in memory (save RAM)
+      docStore.set(id, {
+        ...value,
+        buffer: null, // Don't keep buffer in memory
+        gridFSId,
+        storedInGridFS: true,
+      })
+      return
+    }
+  }
+
+  // Fallback: store everything in memory
   docStore.set(id, value)
+}
+
+async function docStoreGet(id) {
+  const doc = docStore.get(id)
+  if (!doc) return null
+  if (Date.now() > doc.expires) {
+    docStore.delete(id)
+    if (doc.gridFSId) await deleteFromGridFS(doc.gridFSId)
+    return null
+  }
+
+  // If stored in GridFS, fetch the buffer
+  if (doc.storedInGridFS && !doc.buffer && doc.gridFSId) {
+    const buffer = await downloadFromGridFS(doc.gridFSId)
+    if (buffer) {
+      return { ...doc, buffer }
+    }
+    return null // GridFS fetch failed
+  }
+
+  return doc
 }
 
 // ── Share store (MongoDB with file fallback) ─────────────────────────────────
@@ -659,13 +764,13 @@ app.post('/api/analyze', analyzeLimiter, requireAccess, upload.single('pdf'), as
     send({ type: 'progress', msg: 'Building your dashboard…', pct: 95 })
 
     const downloadId = uuidv4()
-    docStoreSet(downloadId, {
+    await docStoreSet(downloadId, {
       buffer: req.file.buffer,
       filename: req.file.originalname || `${type}.pdf`,
       text: truncatedText,
       type,
       analysis,
-      expires: Date.now() + 7_200_000
+      expires: Date.now() + DOC_TTL
     })
 
     send({ type: 'result', data: { ...analysis, downloadId, truncated: wasLarge, usedOcr } })
@@ -688,8 +793,8 @@ app.post('/api/chat', async (req, res) => {
     const { message, downloadId } = req.body
     if (!message) return res.status(400).json({ error: 'Message is required' })
 
-    const doc = docStore.get(downloadId)
-    if (!doc) return res.status(404).json({ error: 'Document session expired. Please re-upload the PDF.' })
+    const doc = docStore.get(downloadId) // Use memory-only for chat (text is cached)
+    if (!doc || Date.now() > doc.expires) return res.status(404).json({ error: 'Document session expired. Please re-upload the PDF.' })
 
     const reply = await runChat(message, doc.text, doc.type)
     res.json({ reply })
@@ -701,14 +806,19 @@ app.post('/api/chat', async (req, res) => {
 })
 
 // GET /api/download/:id  (used by QR code)
-app.get('/api/download/:id', (req, res) => {
-  const doc = docStore.get(req.params.id)
-  if (!doc || Date.now() > doc.expires) {
-    return res.status(404).json({ error: 'File not found or session expired' })
+app.get('/api/download/:id', async (req, res) => {
+  try {
+    const doc = await docStoreGet(req.params.id)
+    if (!doc) {
+      return res.status(404).json({ error: 'File not found or session expired' })
+    }
+    res.setHeader('Content-Type', 'application/pdf')
+    res.setHeader('Content-Disposition', `attachment; filename="${doc.filename}"`)
+    res.send(doc.buffer)
+  } catch (err) {
+    console.error('[download]', err)
+    res.status(500).json({ error: 'Failed to retrieve file' })
   }
-  res.setHeader('Content-Type', 'application/pdf')
-  res.setHeader('Content-Disposition', `attachment; filename="${doc.filename}"`)
-  res.send(doc.buffer)
 })
 
 // POST /api/share  — create a shareable link from an active downloadId
@@ -717,8 +827,8 @@ app.post('/api/share', async (req, res) => {
     const { downloadId } = req.body
     if (!downloadId) return res.status(400).json({ error: 'downloadId required' })
 
-    const doc = docStore.get(downloadId)
-    if (!doc || !doc.analysis) {
+    const doc = docStore.get(downloadId) // Use memory-only (we just need metadata)
+    if (!doc || !doc.analysis || Date.now() > doc.expires) {
       return res.status(404).json({ error: 'Document session expired. Re-upload the PDF to share it.' })
     }
 
@@ -1062,6 +1172,7 @@ const server = app.listen(PORT, () => {
   }
   const redisStatus = redis ? '✓ Upstash Redis' : '✗ In-memory'
   const mongoStatus = process.env.MONGODB_URI ? '✓ MongoDB Atlas' : '✗ File-based'
+  const gridFSStatus = process.env.MONGODB_URI ? '✓ MongoDB GridFS' : '✗ In-memory'
   console.log(`\n🚀  Briefwise server → http://localhost:${PORT}`)
   console.log(`    AI_PROVIDER : ${AI_PROVIDER}`)
   if (AI_PROVIDER === 'anthropic' || AI_PROVIDER === 'both') console.log(`    Anthropic   : ${providerStatus.anthropic}`)
@@ -1069,6 +1180,7 @@ const server = app.listen(PORT, () => {
   if (AI_PROVIDER === 'groq')                                console.log(`    Groq        : ${providerStatus.groq}`)
   console.log(`    Redis       : ${redisStatus} (usage tracking)`)
   console.log(`    MongoDB     : ${mongoStatus} (share links)`)
+  console.log(`    GridFS      : ${gridFSStatus} (PDF storage)`)
   console.log()
 })
 
