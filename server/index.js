@@ -12,9 +12,43 @@ const { v4: uuidv4 } = require('uuid')
 const path = require('path')
 const fs = require('fs')
 const { Redis } = require('@upstash/redis')
+const mongoose = require('mongoose')
 
 // Load .env from parent directory
 dotenv.config({ path: path.join('.env') })
+
+// ── MongoDB setup ────────────────────────────────────────────────────────────
+let mongoConnected = false
+
+if (process.env.MONGODB_URI) {
+  mongoose.connect(process.env.MONGODB_URI)
+    .then(() => {
+      mongoConnected = true
+      console.log('[MongoDB] Connected successfully')
+    })
+    .catch(err => {
+      console.error('[MongoDB] Connection failed:', err.message)
+      console.log('[MongoDB] Falling back to file-based storage for shares')
+    })
+} else {
+  console.log('[MongoDB] No MONGODB_URI — using file-based storage for shares')
+}
+
+// Share schema for MongoDB
+const shareSchema = new mongoose.Schema({
+  shareId: { type: String, required: true, unique: true, index: true },
+  downloadId: String,
+  analysis: mongoose.Schema.Types.Mixed,
+  type: String,
+  filename: String,
+  createdAt: { type: Date, default: Date.now },
+  expires: { type: Date, required: true, index: true },
+})
+
+// Auto-delete expired documents
+shareSchema.index({ expires: 1 }, { expireAfterSeconds: 0 })
+
+const Share = mongoose.model('Share', shareSchema)
 
 // ── Upstash Redis setup ──────────────────────────────────────────────────────
 let redis = null
@@ -196,12 +230,13 @@ function docStoreSet(id, value) {
   docStore.set(id, value)
 }
 
-// ── Share store (persisted to disk) ──────────────────────────────────────────
+// ── Share store (MongoDB with file fallback) ─────────────────────────────────
 // shareId → { analysis, type, title, createdAt, expires }
 const SHARES_FILE = path.join(__dirname, 'shares.json')
 const SHARE_TTL = 30 * 24 * 60 * 60 * 1000 // 30 days
 
-function loadShareStore() {
+// File-based fallback functions
+function loadShareStoreFromFile() {
   try {
     const raw = fs.readFileSync(SHARES_FILE, 'utf8')
     const obj = JSON.parse(raw)
@@ -216,15 +251,60 @@ function loadShareStore() {
   }
 }
 
-function persistShareStore() {
+function persistShareStoreToFile() {
   try {
-    fs.writeFileSync(SHARES_FILE, JSON.stringify(Object.fromEntries(shareStore), null, 2))
+    fs.writeFileSync(SHARES_FILE, JSON.stringify(Object.fromEntries(shareStoreFallback), null, 2))
   } catch (e) {
     console.error('[shares] persist failed:', e.message)
   }
 }
 
-const shareStore = loadShareStore()
+const shareStoreFallback = loadShareStoreFromFile()
+
+// Share store helper functions (MongoDB with file fallback)
+async function getShare(shareId) {
+  if (mongoConnected) {
+    const doc = await Share.findOne({ shareId, expires: { $gt: new Date() } })
+    return doc ? {
+      downloadId: doc.downloadId,
+      analysis: doc.analysis,
+      type: doc.type,
+      filename: doc.filename,
+      createdAt: doc.createdAt.getTime(),
+      expires: doc.expires.getTime(),
+    } : null
+  }
+  const share = shareStoreFallback.get(shareId)
+  return (share && Date.now() < share.expires) ? share : null
+}
+
+async function setShare(shareId, data) {
+  if (mongoConnected) {
+    await Share.create({
+      shareId,
+      downloadId: data.downloadId,
+      analysis: data.analysis,
+      type: data.type,
+      filename: data.filename,
+      createdAt: new Date(data.createdAt),
+      expires: new Date(data.expires),
+    })
+  } else {
+    shareStoreFallback.set(shareId, data)
+    persistShareStoreToFile()
+  }
+}
+
+async function findShareByDownloadId(downloadId) {
+  if (mongoConnected) {
+    const doc = await Share.findOne({ downloadId, expires: { $gt: new Date() } })
+    return doc ? doc.shareId : null
+  }
+  for (const [shareId, share] of shareStoreFallback.entries()) {
+    if (share.downloadId === downloadId) return shareId
+  }
+  return null
+}
 
 const allowedOrigins = process.env.ALLOWED_ORIGINS
   ? process.env.ALLOWED_ORIGINS.split(',').map(o => o.trim())
@@ -632,44 +712,52 @@ app.get('/api/download/:id', (req, res) => {
 })
 
 // POST /api/share  — create a shareable link from an active downloadId
-app.post('/api/share', (req, res) => {
-  const { downloadId } = req.body
-  if (!downloadId) return res.status(400).json({ error: 'downloadId required' })
+app.post('/api/share', async (req, res) => {
+  try {
+    const { downloadId } = req.body
+    if (!downloadId) return res.status(400).json({ error: 'downloadId required' })
 
-  const doc = docStore.get(downloadId)
-  if (!doc || !doc.analysis) {
-    return res.status(404).json({ error: 'Document session expired. Re-upload the PDF to share it.' })
+    const doc = docStore.get(downloadId)
+    if (!doc || !doc.analysis) {
+      return res.status(404).json({ error: 'Document session expired. Re-upload the PDF to share it.' })
+    }
+
+    // Re-use existing share if already created for this downloadId
+    const existingShareId = await findShareByDownloadId(downloadId)
+    if (existingShareId) return res.json({ shareId: existingShareId })
+
+    const shareId = uuidv4()
+    await setShare(shareId, {
+      downloadId,
+      analysis: doc.analysis,
+      type: doc.type,
+      filename: doc.filename,
+      createdAt: Date.now(),
+      expires: Date.now() + SHARE_TTL,
+    })
+    res.json({ shareId })
+  } catch (err) {
+    console.error('[share]', err)
+    res.status(500).json({ error: 'Failed to create share link' })
   }
-
-  // Re-use existing share if already created for this downloadId
-  for (const [shareId, share] of shareStore.entries()) {
-    if (share.downloadId === downloadId) return res.json({ shareId })
-  }
-
-  const shareId = uuidv4()
-  shareStore.set(shareId, {
-    downloadId,
-    analysis: doc.analysis,
-    type: doc.type,
-    filename: doc.filename,
-    createdAt: Date.now(),
-    expires: Date.now() + SHARE_TTL,
-  })
-  persistShareStore()
-  res.json({ shareId })
 })
 
 // GET /api/share/:shareId  — fetch a shared dashboard
-app.get('/api/share/:shareId', (req, res) => {
-  const share = shareStore.get(req.params.shareId)
-  if (!share || Date.now() > share.expires) {
-    return res.status(404).json({ error: 'This share link has expired or does not exist.' })
+app.get('/api/share/:shareId', async (req, res) => {
+  try {
+    const share = await getShare(req.params.shareId)
+    if (!share) {
+      return res.status(404).json({ error: 'This share link has expired or does not exist.' })
+    }
+    res.json({
+      analysis: share.analysis,
+      type: share.type,
+      filename: share.filename,
+    })
+  } catch (err) {
+    console.error('[share]', err)
+    res.status(500).json({ error: 'Failed to fetch share' })
   }
-  res.json({
-    analysis: share.analysis,
-    type: share.type,
-    filename: share.filename,
-  })
 })
 
 app.get('/api/health', (_, res) => res.json({ status: 'ok' }))
@@ -851,11 +939,17 @@ if (fs.existsSync(CLIENT_DIST)) {
 
   // Share pages: inject dynamic meta tags so social previews show document details
   // (WhatsApp, Twitter, LinkedIn don't run JavaScript — they need SSR meta tags)
-  app.get('/share/:shareId', (req, res) => {
-    const share = shareStore.get(req.params.shareId)
+  app.get('/share/:shareId', async (req, res) => {
     const indexPath = path.join(CLIENT_DIST, 'index.html')
 
-    if (!share || Date.now() > share.expires) {
+    let share
+    try {
+      share = await getShare(req.params.shareId)
+    } catch (err) {
+      console.error('[share SSR]', err)
+    }
+
+    if (!share) {
       return res.sendFile(indexPath) // React will show the expired state
     }
 
@@ -966,13 +1060,15 @@ const server = app.listen(PORT, () => {
     gemini:    process.env.GEMINI_API_KEY    ? '✓' : '✗ missing GEMINI_API_KEY',
     groq:      process.env.GROQ_API_KEY      ? '✓' : '✗ missing GROQ_API_KEY',
   }
-  const redisStatus = redis ? '✓ Upstash Redis (persistent)' : '✗ In-memory (resets on restart)'
+  const redisStatus = redis ? '✓ Upstash Redis' : '✗ In-memory'
+  const mongoStatus = process.env.MONGODB_URI ? '✓ MongoDB Atlas' : '✗ File-based'
   console.log(`\n🚀  Briefwise server → http://localhost:${PORT}`)
   console.log(`    AI_PROVIDER : ${AI_PROVIDER}`)
   if (AI_PROVIDER === 'anthropic' || AI_PROVIDER === 'both') console.log(`    Anthropic   : ${providerStatus.anthropic}`)
   if (AI_PROVIDER === 'gemini'    || AI_PROVIDER === 'both') console.log(`    Gemini      : ${providerStatus.gemini}`)
   if (AI_PROVIDER === 'groq')                                console.log(`    Groq        : ${providerStatus.groq}`)
-  console.log(`    Storage     : ${redisStatus}`)
+  console.log(`    Redis       : ${redisStatus} (usage tracking)`)
+  console.log(`    MongoDB     : ${mongoStatus} (share links)`)
   console.log()
 })
 
